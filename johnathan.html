@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Dynamic Spherical Particle System</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <style>
+        body { margin: 0; background-color: #284843; color: #284843; overflow: hidden; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.166.1/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+        import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+        import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+        //import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
+        import { FilmPass } from 'three/addons/postprocessing/FilmPass.js';
+        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+        // Chromatic Aberration Shader
+        const ChromaticAberrationShader = {
+            uniforms: {
+                'tDiffuse': { value: null },
+                'offset': { value: new THREE.Vector2(0.0005, 0.0005) },
+                'opacity': { value: 1 } // Add opacity uniform
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform vec2 offset;
+                uniform float opacity;
+                varying vec2 vUv;
+                void main() {
+                    vec2 uv = vUv;
+                    vec4 original = texture2D(tDiffuse, uv);
+                    float r = texture2D(tDiffuse, uv + offset).r;
+                    float g = texture2D(tDiffuse, uv).g;
+                    float b = texture2D(tDiffuse, uv - offset).b;
+                    vec4 aberration = vec4(r, g, b, 1.0);
+                    gl_FragColor = mix(original, aberration, opacity); // Blend based on opacity
+                }
+            `
+        };
+
+        // Procedural Background Shader
+const ProceduralBackgroundShader = {
+    uniforms: {
+        'tDiffuse': { value: null },
+        'time': { value: 0.0 },
+        'amount': { value: 0.15 } // How much noise to blend in
+    },
+    vertexShader: `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+        }
+    `,
+    fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float time;
+        uniform float amount;
+        varying vec2 vUv;
+
+        // Simple value noise function
+        float rand(vec2 co){
+            return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+        }
+        float noise(vec2 p){
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            float a = rand(i);
+            float b = rand(i + vec2(1.0, 0.0));
+            float c = rand(i + vec2(0.0, 1.0));
+            float d = rand(i + vec2(1.0, 1.0));
+            vec2 u = f*f*(3.0-2.0*f);
+            return mix(a, b, u.x) + (c - a)*u.y*(1.0 - u.x) + (d - b)*u.x*u.y;
+        }
+
+        void main() {
+            vec4 color = texture2D(tDiffuse, vUv);
+            float n = noise(vUv * 10.0 + time * 0.05);
+            vec3 noiseColor = vec3(n * 0.5 + 0.5); // grayscale noise
+            color.rgb = mix(color.rgb, noiseColor, amount);
+            gl_FragColor = color;
+        }
+    `
+};
+
+        // --- Configuration ---
+        const particleCount = 500;
+        const sphereRadius = 10;
+        const entropyFactor = 0.20;
+        const connectionDistance = 3.2;
+        const jitterAmount = 0.2; // Small random movement amplitude
+        
+        // --- Bloom Configuration ---
+        const bloomParams = {
+            strength: 0.18,      // Bloom intensity
+            radius: 0.1,        // Bloom radius
+            threshold: 0.09      // Brightness threshold for bloom
+        };
+
+        // --- Connection Strategy ---
+        let connectionMode = 'DYNAMIC'; // 'DYNAMIC' or 'PERSISTENT'
+        let persistentConnections = new Set(); // Store persistent connections
+
+        let scene, camera, renderer, controls;
+        let points, lines;
+        let lineMaterial;
+        const particles = [];
+        let linePositions = [];
+        let lineColors = [];
+        let startPositions = new Float32Array(particleCount * 3);
+        let endPositions = new Float32Array(particleCount * 3);
+        let originalPositions = new Float32Array(particleCount * 3); // Store original positions for reset
+
+        // --- Post-processing ---
+        let composer, renderPass, bloomPass, outputPass, afterimagePass;
+
+        const clock = new THREE.Clock();
+
+        // --- State Management ---
+        let currentState = 'WAITING'; // Start in a waiting state before the first move
+        let progress = 0; // A 0-to-1 value tracking progress of the current state
+        let resetProgress = 0; // Flag to reset progress
+        let reset = false; // Flag to reset positions
+        const MOVE_DURATION = 5.0; // 5 seconds to move
+        const WAIT_DURATION = 0.1; // 0.1 seconds to wait
+
+        // --- Data Structures ---
+        // Using a Map for efficient lookups. Key is a unique number for each particle pair.
+        const connections = new Map(); 
+        // Adjacency list to quickly find neighbors for triangle checks
+        const particleNeighbors = Array.from({ length: particleCount }, () => new Set()); 
+
+        init();
+        animate();
+
+        // Helper to create a unique key for a pair of particle indices
+        function getConnectionKey(i, j) {
+            return i < j ? (i << 16) | j : (j << 16) | i;
+        }
+
+        function easeInOutQuint(t) {
+        return t < 0.5
+            ? 16 * t * t * t * t * t
+            : 1 - Math.pow(-2 * t + 2, 5) / 2;
+        }
+
+        // Helper function to add a line segment to the arrays
+        function addLineSegment(i, j, dist, isDynamic = false) {
+            // Add positions for line segment (2 points, 3 coordinates each)
+            linePositions.push(
+                particles[i].position.x, particles[i].position.y, particles[i].position.z,
+                particles[j].position.x, particles[j].position.y, particles[j].position.z
+            );
+            
+            if (isDynamic) {
+                // Distance-based properties for dynamic connections
+                const normalizedDist = dist / connectionDistance; // 0 to 1 (close to far)
+                const proximity = 1.0 - normalizedDist; // 1 to 0 (close to far)
+                
+                // Color: transition from bright orange (close) to dim red (far)
+                const r = Math.max(0.3, 0.7 + proximity * 0.2); // 0.8-1.0 range
+                const g = Math.max(0.3, 0.3 + proximity * 0.8); // 0.0-0.6 range  
+                const b = Math.max(0.3, 0.3 + proximity * 0.8); // 0.0-0.3 range
+
+
+                lineColors.push(
+                    r, g, b,  // First point color
+                    r, g, b   // Second point color
+                );
+            } else {
+                // Default coloring for persistent connections
+                const intensity = Math.max(0.3, 1.0 - (dist / connectionDistance));
+                lineColors.push(
+                    intensity, intensity * 0.5, 0.2,  // First point color (orangish)
+                    intensity, intensity * 0.5, 0.2   // Second point color (orangish)
+                );
+            }
+        }
+
+        // Strategy 1: Dynamic connections based on distance
+        function updateDynamicConnections() {
+            linePositions = [];
+            lineColors = [];
+            
+            for (let i = 0; i < particleCount; i++) {
+                for (let j = i + 1; j < particleCount; j++) {
+                    const dist = particles[i].position.distanceTo(particles[j].position);
+                    
+                    if (dist < connectionDistance) {
+                        addLineSegment(i, j, dist, true); // Pass true for dynamic mode
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Persistent connections (once connected, stay connected)
+        function updatePersistentConnections() {
+            linePositions = [];
+            lineColors = [];
+            
+            // Check for new connections and add to persistent set
+            for (let i = 0; i < particleCount; i++) {
+                for (let j = i + 1; j < particleCount; j++) {
+                    const dist = particles[i].position.distanceTo(particles[j].position);
+                    const key = getConnectionKey(i, j);
+                    
+                    if (dist < connectionDistance && !persistentConnections.has(key)) {
+                        persistentConnections.add(key);
+                    }
+                }
+            }
+            
+            // Draw all persistent connections
+            for (const key of persistentConnections) {
+                const i = (key >> 16) & 0xFFFF;
+                const j = key & 0xFFFF;
+                const dist = particles[i].position.distanceTo(particles[j].position);
+                addLineSegment(i, j, dist, false); // Pass false for persistent mode
+            }
+            
+            // Reset line material to default values for persistent connections
+            lineMaterial.opacity = 0.95;
+            lineMaterial.linewidth = 3.0;
+            lineMaterial.needsUpdate = true;
+        }
+
+        // Main update function that delegates to the appropriate strategy
+        function updateConnections() {
+            switch (connectionMode) {
+                case 'DYNAMIC':
+                    updateDynamicConnections();
+                    break;
+                case 'PERSISTENT':
+                    updatePersistentConnections();
+                    break;
+                default:
+                    updateDynamicConnections();
+            }
+            
+            // FIXED: Properly update the geometry with new data
+            if (linePositions.length > 0) {
+                // Create new geometry instance when line count changes significantly
+                const newLineCount = linePositions.length / 6; // 6 values per line (2 points * 3 coordinates)
+                const currentLineCount = lines.geometry.attributes.position ? 
+                    lines.geometry.attributes.position.count / 2 : 0;
+                
+                // If the line count changed significantly, recreate the geometry
+                if (Math.abs(newLineCount - currentLineCount) > currentLineCount * 0.1) {
+                    const newGeometry = new LineSegmentsGeometry();
+                    newGeometry.setPositions(linePositions);
+                    newGeometry.setColors(lineColors);
+                    
+                    // Dispose old geometry to prevent memory leaks
+                    lines.geometry.dispose();
+                    lines.geometry = newGeometry;
+                } else {
+                    // For small changes, just update the existing geometry
+                    lines.geometry.setPositions(linePositions);
+                    lines.geometry.setColors(lineColors);
+                }
+            } else {
+                // No lines to draw - create empty geometry
+                const emptyGeometry = new LineSegmentsGeometry();
+                lines.geometry.dispose();
+                lines.geometry = emptyGeometry;
+            }
+        }
+
+
+
+        function createRandomMatrix() {
+                    // A helper function to get a random number in a range
+            function randomInRange(min, max) {
+                return Math.random() * (max - min) + min;
+            }
+
+            // 1. Generate a random translation vector
+            const randomTranslation = new THREE.Vector3(
+                randomInRange(-5, 5),   // x
+                randomInRange(-5, 5),   // y
+                randomInRange(-5, 5)    // z
+            );
+
+            // 2. Generate a random rotation using Euler angles (a full circle is 2 * PI)
+            const randomRotation = new THREE.Euler(
+                randomInRange(0, Math.PI * 2), // x rotation
+                randomInRange(0, Math.PI * 2), // y rotation
+                randomInRange(0, Math.PI * 2)  // z rotation
+            );
+
+            // 3. Generate a random uniform scale
+            const randomScaleValue = randomInRange(0.5, 1.5);
+                const randomScale = new THREE.Vector3(
+                randomScaleValue,
+                randomScaleValue,
+                randomScaleValue
+            );
+            // Use the logic from the previous step to get these..
+            const translation = randomTranslation;
+            const eulerRotation = randomRotation;
+            const scale = randomScale;
+
+            // Convert the Euler rotation to a Quaternion
+            const quaternionRotation = new THREE.Quaternion().setFromEuler(eulerRotation);
+
+            // Compose the final matrix
+            const randomMatrix = new THREE.Matrix4();
+            randomMatrix.compose(translation, quaternionRotation, scale);
+
+            return randomMatrix;
+        }
+
+
+
+        // Utility functions to change connection mode
+        function setConnectionMode(mode) {
+            connectionMode = mode;
+            if (mode === 'PERSISTENT') {
+                // Initialize with current connections
+                initializePersistentConnections();
+            } else if (mode === 'DYNAMIC') {
+                // Clear persistent connections when switching to dynamic
+                persistentConnections.clear();
+            }
+        }
+
+        function initializePersistentConnections() {
+            persistentConnections.clear();
+            for (let i = 0; i < particleCount; i++) {
+                for (let j = i + 1; j < particleCount; j++) {
+                    const dist = particles[i].position.distanceTo(particles[j].position);
+                    if (dist < connectionDistance) {
+                        persistentConnections.add(getConnectionKey(i, j));
+                    }
+                }
+            }
+        }
+
+        // Function to reset persistent connections (useful for experimentation)
+        function resetConnections() {
+            persistentConnections.clear();
+        }
+        
+
+        function init() {
+            // --- Scene, Camera, Renderer ---
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x284843);  //0x1f244b);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 25;
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+            
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            //controls.autoRotate = true;
+            //controls.autoRotateSpeed = 0.3;
+
+            // --- Post-processing Setup ---
+            composer = new EffectComposer(renderer);
+            composer.setPixelRatio(window.devicePixelRatio);
+
+            // Render pass
+            renderPass = new RenderPass(scene, camera);
+            composer.addPass(renderPass);
+
+            // Afterimage pass
+            //afterimagePass = new AfterimagePass();
+            //composer.addPass(afterimagePass);
+
+            // Bloom pass
+            bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                bloomParams.strength,
+                bloomParams.radius,
+                bloomParams.threshold
+            );
+            composer.addPass(bloomPass);
+
+            // Add film dithering effect
+                const filmPass = new FilmPass(
+                    0.7, // noise intensity
+                    0.8, // scanline intensity
+                    323, // scanline count
+                    false // grayscale
+                );
+            composer.addPass(filmPass);
+            
+            // Chromatic Aberration pass
+            const chromaticAberrationPass = new ShaderPass(ChromaticAberrationShader);
+            composer.addPass(chromaticAberrationPass);
+
+            // Output pass
+            outputPass = new OutputPass();
+            composer.addPass(outputPass);
+
+
+
+            composer.setSize( window.innerWidth, window.innerHeight );
+
+            // --- Particle Creation ---
+            const pointGeometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(particleCount * 3);
+            for (let i = 0; i < particleCount; i++) {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                let x = sphereRadius * Math.sin(phi) * Math.cos(theta);
+                let y = sphereRadius * Math.sin(phi) * Math.sin(theta);
+                let z = sphereRadius * Math.cos(phi);
+                const basePosition = new THREE.Vector3(x, y, z);
+                const currentPosition = basePosition.clone().add(
+                    new THREE.Vector3(
+                        (Math.random() - 0.5) * entropyFactor * sphereRadius,
+                        (Math.random() - 0.5) * entropyFactor * sphereRadius,
+                        (Math.random() - 0.5) * entropyFactor * sphereRadius
+                    )
+                );
+                positions[i * 3] = currentPosition.x;
+                positions[i * 3 + 1] = currentPosition.y;
+                positions[i * 3 + 2] = currentPosition.z;
+                
+                // Initialize start and end positions
+                startPositions[i * 3] = currentPosition.x;
+                startPositions[i * 3 + 1] = currentPosition.y;
+                startPositions[i * 3 + 2] = currentPosition.z;
+                endPositions[i * 3] = currentPosition.x;
+                endPositions[i * 3 + 1] = currentPosition.y;
+                endPositions[i * 3 + 2] = currentPosition.z;
+                originalPositions[i * 3] = currentPosition.x;
+                originalPositions[i * 3 + 1] = currentPosition.y;
+                originalPositions[i * 3 + 2] = currentPosition.z;
+                
+                particles.push({
+                    position: currentPosition,
+                    basePosition: currentPosition.clone()
+                });
+            }
+
+            pointGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            points = new THREE.Points(pointGeometry, new THREE.PointsMaterial({
+                color: 0xFFFFFF, 
+                size: 0.0,  
+                blending: THREE.AdditiveBlending, 
+                transparent: true
+            }));
+            scene.add(points);
+
+            // --- Thick Line Setup ---
+            const lineGeometry = new LineSegmentsGeometry();
+            lineMaterial = new LineMaterial({
+                color: 0xd18234, 
+                linewidth: 3.0,  // This will be dynamically updated for DYNAMIC mode
+                transparent: true, 
+                opacity: 0.95,    // This will be dynamically updated for DYNAMIC mode
+                resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
+                vertexColors: true  // Enable vertex colors for distance-based coloring
+            });
+            lines = new LineSegments2(lineGeometry, lineMaterial);
+            scene.add(lines);
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            lineMaterial.resolution.set(window.innerWidth, window.innerHeight);
+            
+            // Update bloom pass resolution
+            //bloomPass.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function startNewCycle(reset = false) {
+            // 1. The previous end positions become the new start positions
+            startPositions.set(endPositions);
+
+            if (reset == false) {
+                // 2. Update your matrices with new logic (e.g., random rotation)
+                const matrix1 = createRandomMatrix();
+                const matrix2 = createRandomMatrix();
+
+                // 3. Calculate the new target (end) positions
+                const particleGroups = new Array(particleCount);
+                for (let i = 0; i < particleCount; i++) {
+                    particleGroups[i] = Math.random() < 0.5 ? 0 : 1; // Randomly assign 0 or 1
+                }
+
+                const tempVec = new THREE.Vector3();
+                for (let i = 0; i < particleCount; i++) {
+                    // Start with the current position
+                    tempVec.fromArray(startPositions, i * 3);
+
+                    // Apply the correct matrix based on odd/even index
+                    if (particleGroups[i] === 0) {
+                        tempVec.applyMatrix4(matrix1);
+                    } else {
+                        tempVec.applyMatrix4(matrix2);
+                    }
+
+                    // Store the result in our endPositions buffer
+                    endPositions[i * 3] = tempVec.x;
+                    endPositions[i * 3 + 1] = tempVec.y;
+                    endPositions[i * 3 + 2] = tempVec.z;
+                } 
+
+            } else if (reset == true) {
+                // Reset end positions to original positions
+                for (let i = 0; i < particleCount; i++) {
+                    endPositions[i * 3] = originalPositions[i * 3];
+                    endPositions[i * 3 + 1] = originalPositions[i * 3 + 1];
+                    endPositions[i * 3 + 2] = originalPositions[i * 3 + 2];
+                }
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // --- Animate Particles ---
+            const pointPositions = points.geometry.attributes.position.array;
+            const positionAttribute = points.geometry.attributes.position;
+            const time = Date.now() * 0.0003;
+            //const jitter_time = Date.now() * 0.0001; // Slower time for smoother wave effect
+
+            const deltaTime = clock.getDelta(); // Time since last frame
+
+            switch (currentState) {
+                case 'MOVING':
+                    // Update progress of the move
+                    progress += deltaTime / MOVE_DURATION;
+
+                    const linearProgress = Math.min(progress, 1.0);
+
+                    const easedProgress = easeInOutQuint(linearProgress);
+
+                    // Lerp every particle's position
+                    const tempVecStart = new THREE.Vector3();
+                    const tempVecEnd = new THREE.Vector3();
+                    const finalPos = new THREE.Vector3();
+
+                    for (let i = 0; i < particleCount; i++) {
+                        tempVecStart.fromArray(startPositions, i * 3);
+                        tempVecEnd.fromArray(endPositions, i * 3);
+
+                        // Replace the jitter lines with:
+
+                        finalPos.lerpVectors(tempVecStart, tempVecEnd, Math.min(easedProgress, 1.0));
+                        positionAttribute.setXYZ(i, finalPos.x, finalPos.y, finalPos.z);
+
+                        // Update particle object positions for connection calculations
+                        particles[i].position.copy(finalPos);
+                    }
+                    positionAttribute.needsUpdate = true;
+
+                    // If move is finished, switch to the WAITING state
+                    if (progress >= 1.0) {
+                        progress = 0;
+                        currentState = 'WAITING';
+                        setConnectionMode('DYNAMIC'); // Recalculate connections after move
+                    }
+                    break;
+
+                // apply affine transformation
+                case 'WAITING':
+                    // Update progress of the wait
+                    progress += deltaTime / WAIT_DURATION;
+
+                    // If wait is over, start a new cycle and switch to MOVING
+                    if (progress >= 1.0) {
+                        resetProgress++;
+                        if (resetProgress >= 5) {
+                            resetProgress = 0;
+                            startNewCycle(reset = true); // Reset positions every 5 cycles
+                            progress = 0;
+                            currentState = 'MOVING';
+                            resetProgress = 0; // Reset progress for the next cycle
+
+                        } else {
+                            startNewCycle();
+                            progress = 0;
+                            currentState = 'MOVING';
+                        }
+                    }
+                    break;
+            }
+
+            points.geometry.attributes.position.needsUpdate = true;
+            //points.geometry.computeBoundingSphere();
+
+            // --- Update Connections ---
+            updateConnections();
+
+            controls.update();
+            composer.render();
+        }
+    </script>
+</body>
+</html>
