@@ -1,6 +1,10 @@
-# Dynamic Spherical Particle System
+# Johnathan-the-particle-friend
 
-A sophisticated Three.js-based particle system featuring dynamic transformations, intelligent connection algorithms, and post-processing effects.
+This is a particle system called Johnathan with three.js ancestry. Starts as a sphere then does some sick breakdancing by continuosly splitting in two before having a rest. He's pretty chill :D
+
+He was even chiller before I asked Claude for feedback on how "professional" the code is and Claude made somekind of crazy multifile setup I had to reverse engineer and make less terrible.  The original system is called "johnathan.js."  To run the full multifile setup you'll have to run some kind of local server.  I use "npm http-server."  
+
+Disclaimer - I'm a terrible programmer.  Oh, and Claude told me a bunch of stuff to pass on to you about the multifile version, which I have left below.
 
 ## Features
 
@@ -76,6 +80,3 @@ The code follows modern ES6+ patterns with:
 - Error handling and graceful degradation
 - Comprehensive inline documentation
 
-## License
-
-MIT License - feel free to use and modify for your projects.
